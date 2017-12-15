@@ -1,0 +1,117 @@
+* seq2seq 笔记
+
+参考:
+- tutorial: [[https://www.tensorflow.org/programmers_guide/variable_scope][Sharing Variables | TensorFlow]]
+- tutorial: [[https://www.tensorflow.org/tutorials/seq2seq][Sequence-to-Sequence Models | TensorFlow]]
+- source code: [[https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/legacy_seq2seq/python/ops/seq2seq.py][tensorflow/seq2seq.py]]
+  - 重点读: =embedding_rnn_seq2seq= 和 =sequence_loss=
+
+
+** sharing variables
+
+复杂模型常常有共享参数的需求. 典型例子比如 seq2seq 模型中的训练和生成这两个过程.
+
+共享参数可以有以下几种方式:
+- 专门用一段代码来创建参数, 然后传给函数. 这种方式的缺点是会破坏"封装"原则.
+- 使用 OOP
+- 利用 Variable Scope: 这是一种更为轻量级的解决方式.
+
+*** Variable Scope
+
+TensorFlow 中的 Vaviable Scope 机制主要包括两个函数:
+- =tf.get_variable()=
+- =tf.variable_scope=
+
+** seq2seq
+
+一个 sequence-to-sequence 模型由两部分组成: encoder 和 decoder. TensorFlow 中的 decoder  实际上在论文提到的架构基础上做了简化.
+
+更复杂的模型还可以引入 attention 机制, 目的是让 decoder 能更直接地联结到输入数据. 见论文 [[http://arxiv.org/abs/1409.0473][Bahdanau et al., 2014]].
+
+*** 有两个参数值得注意
+
+**** =feed_previous= 
+
+用于区分训练和生成时的不同做法, 见下表.
+
+| phase           | training         | test                    |
+|-----------------+------------------+-------------------------|
+| feed_previous   | False            | True                    |
+| decoder_inputs  | use all          | use first               |
+| feed to decoder | "correct" inputs | output of previous step |
+
+不过, 训练时也有 feed_previous 的做法, 可以让模型 "more robust to its own mistakes".
+
+**** =output_projection=
+
+默认情况下 =output_projection = None=, 此时输出的张量形状为 batch_size x num_decoder_symbols. 当输出词表 很大时, 这个张量也就会非常大, 不易存储.
+
+而如果设置了 =output_projection= (其格式为 =(W, B)= 元组), 输出的张量形状就变为较小的 batch_size x cell_size.
+
+output projection 可以与 sampled softmax 搭配使用, 可节约训练时间.
+
+*** bucketing
+
+bucketing 是处理变长句子的方法. 因为不同长度的输入和输出需要定义不同的计算图, 因此, 通过 bucketing 和 padding 把句子统一为一组固定的长度, 可以使计算图不至于那么庞大. 每个 bucket 是一对 lengths, 分别为输入和输出句子的长度.
+
+TenforFlow 为 seq2seq 问题提供了一个可以使用 bucketing 的接口: =tf.contrib.legacy_seq2seq.model_with_buckets=. 它可以方便地返回损失函数(第二个返回值). 它返回的 outputs 和 losses 都是一个列表, 其中每个元素对应一个 bucket.
+
+*** 读 seq2seq.py 源码
+
+代码可读性好, 注释清晰, 是值得学习的典范. 对重要的接口, 读源码有助于理解接口的原理.
+
+这里包含的一部分函数:
+
+- sequence-to-sequence models.
+  - basic_rnn_seq2seq: The most basic RNN-RNN model.
+  - embedding_rnn_seq2seq: The basic model with input embedding.
+  - embedding_attention_seq2seq: Advanced model with input embedding and
+    the neural attention mechanism; recommended for complex tasks.
+- Losses.
+  - sequence_loss: Loss for a sequence model returning average log-perplexity.
+  - sequence_loss_by_example: As above, but not averaging over all examples.
+- model_with_buckets: A convenience function to create models with bucketing.
+
+*** seq2seq.py 中的 sequence_loss 和 sequence_loss_by_example  函数
+
+上面提到的 =model_with_buckets= 接口中封装起来的损失函数的计算就是用到了这两个函数. 阅读这两个函数的源码有助于理解 seq2seq 架构中的 decoder.
+
+decoder 的每一步都是一个 softmax 问题. logits, targets, weights 都是不同时间步下的 list:
+
+#+begin_src
+Args:
+  logits: List of 2D Tensors of shape [batch_size x num_decoder_symbols].
+  targets: List of 1D batch-sized int32 Tensors of the same length as logits.
+  weights: List of 1D batch-sized float-Tensors of the same length as logits.
+#+end_src
+
+比如一个长度为3的 decoder, 其 loss 的计算过程可描述为:
+
+#+begin_src
+    t1  -> t2  -> t3
+2D: l1     l2     l3    -> logits
+1D: t1     t2     t3    -> targets
+1D: w1     w2     w3    -> weights
+ ce1*w1  ce2*w2  ce3*w3 -> log_perp_list -> loss
+#+end_src
+
+log_perp_list 中每个元素即为各时间步下交叉熵与权重的乘积. 对这个列表求和或求平均就得到了 loss.
+
+#+begin_src
+  for logit, target, weight in zip(logits, targets, weights):
+    crossent = nn_ops.sparse_softmax_cross_entropy_with_logits(
+        labels=target, logits=logit)
+    log_perp_list.append(crossent * weight)
+#+end_src
+
+*** seq2seq 难点
+
+从上周的 RNN 到这周的 seq2seq, 理解和实施的难度有所增加.
+
+难点之一是, seq2seq 接收的输入形式比较特别, 需要去适应一番.
+  + 两种输入: encoder_inputs, decoer_inputs.
+  + decoder_inputs 在训练和生成时采用不同的处理方法: 是否 feed_previous.
+  + 输入都是不同时间步的 list of tensors, 需要做一次转置.
+
+另外, 代码中引入 bucketing 后, 相当于多了一个层级, 代码逻辑变得更复杂了.
+
